@@ -710,10 +710,12 @@ class Plugin(BasePlugin):
 
     @hook
     def init_menubar(self, window: 'ElectrumWindow'):
-        window.tools_menu.addAction(
+        from electrum.gui.qt.util import read_QIcon_from_bytes
+        action = window.tools_menu.addAction(
             _('LN Graph Visualizer'),
             partial(self.show_dialog, window),
         )
+        action.setIcon(read_QIcon_from_bytes(self.read_file('ln_graph.png')))
 
     def show_dialog(self, window: 'ElectrumWindow'):
         network = window.network
