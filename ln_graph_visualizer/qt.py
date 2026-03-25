@@ -4,7 +4,7 @@ from functools import partial
 from PyQt6.QtWidgets import (
     QVBoxLayout, QHBoxLayout, QPushButton, QLabel, QDialog,
     QTextEdit, QLineEdit, QComboBox, QSpinBox, QSplitter,
-    QWidget, QMenu, QApplication, QGroupBox,
+    QWidget, QMenu, QApplication, QTabWidget,
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal
 from PyQt6.QtGui import QFont
@@ -16,12 +16,15 @@ from electrum.util import format_time
 from electrum.lnutil import LnFeatures
 
 from .graph_data import (
-    GraphNode, GraphEdge, extract_neighborhood, extract_path_subgraph,
+    GraphNode, GraphEdge, extract_neighborhood,
     get_node_display_name,
 )
 from .graph_layout import LayoutWorker
 from .graph_scene import GraphView, PATH_COLORS
-from .pathfinding import find_k_paths, compute_path_summary
+from .pathfinding import (
+    find_paths_and_extract, compute_path_summary,
+    parse_invoice_for_routing, InvoiceRoutingContext,
+)
 
 PATH_COLOR_NAMES = ['green', 'gold', 'orange', 'red']
 assert len(PATH_COLOR_NAMES) == len(PATH_COLORS)
@@ -72,19 +75,9 @@ class PathWorker(QThread):
 
     def run(self):
         try:
-            results = find_k_paths(
+            results, path_sub, ctx_sub = find_paths_and_extract(
                 self.channel_db, self.source, self.dest,
-                self.amount_msat, self.k,
-            )
-            if results:
-                paths = [r[0] for r in results]
-                ctx_nodes, ctx_edges, path_nodes, path_edges = extract_path_subgraph(
-                    self.channel_db, paths, context_hops=1)
-                path_sub = (path_nodes, path_edges)
-                ctx_sub = (ctx_nodes, ctx_edges)
-            else:
-                path_sub = ({}, {})
-                ctx_sub = ({}, {})
+                self.amount_msat, self.k)
             self.finished.emit(results, path_sub, ctx_sub)
         except Exception as e:
             _logger.error(f"PathWorker error: {e}", exc_info=True)
@@ -120,12 +113,42 @@ class SearchWorker(QThread):
             self.finished.emit(None, None)
 
 
+class InvoicePathWorker(QThread):
+    """Parse a bolt11 invoice and find routes in background."""
+    finished = pyqtSignal(list, object, object, object)  # results, path_sub, ctx_sub, invoice_ctx
+    error = pyqtSignal(str)
+
+    def __init__(self, channel_db, bolt11_str, source, k, my_sending_channels=None):
+        super().__init__()
+        self.channel_db = channel_db
+        self.bolt11_str = bolt11_str
+        self.source = source
+        self.k = k
+        self.my_sending_channels = my_sending_channels
+
+    def run(self):
+        try:
+            ctx = parse_invoice_for_routing(self.bolt11_str, self.channel_db)
+
+            results, path_sub, ctx_sub = find_paths_and_extract(
+                self.channel_db, self.source, ctx.destination,
+                ctx.amount_msat, self.k,
+                my_sending_channels=self.my_sending_channels,
+                private_route_edges=ctx.private_route_edges)
+
+            self.finished.emit(results, path_sub, ctx_sub, ctx)
+        except Exception as e:
+            _logger.error(f"InvoicePathWorker error: {e}", exc_info=True)
+            self.error.emit(str(e))
+
+
 class GraphDialog(QDialog):
 
-    def __init__(self, channel_db: 'ChannelDB', own_pubkey: Optional[bytes], parent=None):
+    def __init__(self, channel_db: 'ChannelDB', own_pubkey: Optional[bytes], parent=None, lnworker=None):
         super().__init__(parent)
         self.channel_db = channel_db
         self.own_pubkey = own_pubkey
+        self.lnworker = lnworker
 
         self.setWindowTitle(_('LN Graph Visualizer'))
         self.setMinimumSize(1000, 700)
@@ -140,7 +163,9 @@ class GraphDialog(QDialog):
         self._data_worker: Optional[DataWorker] = None
         self._path_worker: Optional[PathWorker] = None
         self._search_worker: Optional[SearchWorker] = None
-        self._pending_highlight = None  # (source, dest, amount_msat) to apply after layout
+        self._invoice_worker: Optional[InvoicePathWorker] = None
+        self._pending_highlight = None  # (source, dest, amount_msat) deferred until layout finishes
+        self._node_labels: Dict[bytes, str] = {}  # role labels for nodes without aliases (e.g. Sender/Recipient)
         self._scene_stale = True  # True when self._nodes/_edges changed and scene needs rebuild
 
         self._setup_ui()
@@ -150,6 +175,14 @@ class GraphDialog(QDialog):
             self.seed_input.setText(self.own_pubkey.hex())
 
         self._update_status()
+
+    @staticmethod
+    def _make_k_spinbox() -> QSpinBox:
+        spin = QSpinBox()
+        spin.setRange(1, 10)
+        spin.setValue(3)
+        spin.setMaximumWidth(60)
+        return spin
 
     def _setup_ui(self):
         main_layout = QVBoxLayout(self)
@@ -191,10 +224,12 @@ class GraphDialog(QDialog):
 
         main_layout.addLayout(toolbar)
 
-        # --- pathfinding controls ---
-        path_frame = QGroupBox(_('Pathfinding'))
-        path_layout = QHBoxLayout(path_frame)
-        path_layout.setContentsMargins(6, 18, 6, 4)
+        # --- pathfinding / invoice route tabs ---
+        self.path_tabs = QTabWidget()
+
+        path_widget = QWidget()
+        path_layout = QHBoxLayout(path_widget)
+        path_layout.setContentsMargins(6, 6, 6, 4)
 
         path_layout.addWidget(QLabel(_('Source:')))
         self.source_input = QLineEdit()
@@ -213,11 +248,7 @@ class GraphDialog(QDialog):
         path_layout.addWidget(self.amount_input)
 
         path_layout.addWidget(QLabel(_('Paths:')))
-        self.k_spin = QSpinBox()
-        self.k_spin.setMinimum(1)
-        self.k_spin.setMaximum(10)
-        self.k_spin.setValue(3)
-        self.k_spin.setMaximumWidth(60)
+        self.k_spin = self._make_k_spinbox()
         path_layout.addWidget(self.k_spin)
 
         self.find_paths_btn = QPushButton(_('Find Paths'))
@@ -225,7 +256,29 @@ class GraphDialog(QDialog):
         self.clear_paths_btn = QPushButton(_('Clear'))
         path_layout.addWidget(self.clear_paths_btn)
 
-        main_layout.addWidget(path_frame)
+        self.path_tabs.addTab(path_widget, _('Pathfinding'))
+
+        inv_widget = QWidget()
+        inv_layout = QHBoxLayout(inv_widget)
+        inv_layout.setContentsMargins(6, 6, 6, 4)
+
+        inv_layout.addWidget(QLabel(_('Invoice:')))
+        self.invoice_input = QLineEdit()
+        self.invoice_input.setPlaceholderText(_('lnbc1...'))
+        inv_layout.addWidget(self.invoice_input, 1)
+
+        inv_layout.addWidget(QLabel(_('Paths:')))
+        self.invoice_k_spin = self._make_k_spinbox()
+        inv_layout.addWidget(self.invoice_k_spin)
+
+        self.find_invoice_btn = QPushButton(_('Find Invoice Route'))
+        inv_layout.addWidget(self.find_invoice_btn)
+        self.clear_invoice_btn = QPushButton(_('Clear'))
+        inv_layout.addWidget(self.clear_invoice_btn)
+
+        self.path_tabs.addTab(inv_widget, _('Invoice Route'))
+
+        main_layout.addWidget(self.path_tabs)
 
         # --- main area: graph + info panel ---
         splitter = QSplitter(Qt.Orientation.Horizontal)
@@ -291,6 +344,10 @@ class GraphDialog(QDialog):
         self.search_btn.clicked.connect(self._on_search)
         self.search_input.returnPressed.connect(self._on_search)
         self.capacity_filter.currentIndexChanged.connect(self._on_capacity_filter_changed)
+
+        self.find_invoice_btn.clicked.connect(self._on_find_invoice_paths)
+        self.clear_invoice_btn.clicked.connect(self._on_clear_paths)
+        self.invoice_input.returnPressed.connect(self._on_find_invoice_paths)
 
         self.graph_view.node_clicked.connect(self._on_node_clicked)
         self.graph_view.edge_clicked.connect(self._on_edge_clicked)
@@ -365,6 +422,7 @@ class GraphDialog(QDialog):
 
     def _on_data_loaded(self, nodes, edges):
         self.load_btn.setEnabled(True)
+        self._data_worker = None
         if not nodes:
             self.status_label.setText(_('No nodes found for this pubkey'))
             return
@@ -377,9 +435,7 @@ class GraphDialog(QDialog):
         self.status_label.setText(_('Computing layout...'))
         self.relayout_btn.setEnabled(False)
 
-        if self._layout_worker and self._layout_worker.isRunning():
-            self._layout_worker.stop()
-            self._layout_worker.wait()
+        self._stop_worker(self._layout_worker)
 
         self._layout_worker = LayoutWorker(
             nodes, edges, iterations=80,
@@ -485,6 +541,7 @@ class GraphDialog(QDialog):
         amount_msat = amount_sat * 1000
         k = self.k_spin.value()
 
+        self._node_labels.clear()
         self.status_label.setText(_('Finding paths...'))
         self.find_paths_btn.setEnabled(False)
 
@@ -492,12 +549,15 @@ class GraphDialog(QDialog):
         self._path_worker = PathWorker(
             self.channel_db, source, dest, amount_msat, k)
         self._path_worker.finished.connect(
-            partial(self._on_paths_found, source, dest, amount_msat))
+            partial(self._on_manual_paths_found, source, dest, amount_msat))
         self._path_worker.start()
 
-    def _on_paths_found(self, source, dest, amount_msat, results, path_sub, ctx_sub):
+    def _on_manual_paths_found(self, source, dest, amount_msat, results, path_sub, ctx_sub):
         self.find_paths_btn.setEnabled(True)
+        self._path_worker = None
+        self._on_paths_found(source, dest, amount_msat, results, path_sub, ctx_sub)
 
+    def _on_paths_found(self, source, dest, amount_msat, results, path_sub, ctx_sub):
         if not results:
             self.status_label.setText(_('No paths found'))
             self.path_text.setPlainText(_('No paths found between these nodes.'))
@@ -533,6 +593,11 @@ class GraphDialog(QDialog):
             else:
                 self._apply_path_highlights(source, dest, amount_msat)
 
+    def _node_display(self, node: Optional[GraphNode], node_id: bytes) -> str:
+        if node_id in self._node_labels:
+            return self._node_labels[node_id]
+        return get_node_display_name(node, node_id)
+
     def _apply_path_highlights(self, source, dest, amount_msat):
         self.graph_view.highlight_paths(self._current_paths, source, dest)
 
@@ -549,8 +614,8 @@ class GraphDialog(QDialog):
             for j, edge in enumerate(self._current_paths[i]):
                 src_item = self._nodes.get(edge.start_node)
                 dst_item = self._nodes.get(edge.end_node)
-                src_name = get_node_display_name(src_item) if src_item else edge.start_node.hex()[:16] + '...'
-                dst_name = get_node_display_name(dst_item) if dst_item else edge.end_node.hex()[:16] + '...'
+                src_name = self._node_display(src_item, edge.start_node)
+                dst_name = self._node_display(dst_item, edge.end_node)
                 lines.append(f"  {j + 1}. {src_name} -> {dst_name}")
                 lines.append(f"     chan: {edge.short_channel_id}")
                 if j < len(route):
@@ -565,9 +630,79 @@ class GraphDialog(QDialog):
     def _on_clear_paths(self):
         self._current_paths = []
         self._current_routes = []
+        self._node_labels.clear()
         self.graph_view.clear_highlights()
         self.path_text.clear()
         self._update_status()
+
+    # --- invoice pathfinding ---
+
+    def _on_find_invoice_paths(self):
+        bolt11 = self.invoice_input.text().strip()
+        if not bolt11:
+            self.status_label.setText(_('Please paste a bolt11 invoice'))
+            return
+        if self.own_pubkey is None:
+            self.status_label.setText(_('No Lightning wallet available — cannot determine source node'))
+            return
+
+        k = self.invoice_k_spin.value()
+        self.status_label.setText(_('Parsing invoice and finding routes...'))
+        self.find_invoice_btn.setEnabled(False)
+
+        my_sending_channels = None
+        if self.lnworker:
+            my_sending_channels = {
+                chan.short_channel_id: chan
+                for chan in self.lnworker.get_channels_for_sending()
+                if chan.short_channel_id is not None
+            }
+
+        self._stop_worker(self._invoice_worker)
+        self._invoice_worker = InvoicePathWorker(
+            self.channel_db, bolt11, self.own_pubkey, k,
+            my_sending_channels=my_sending_channels)
+        self._invoice_worker.finished.connect(self._on_invoice_paths_found)
+        self._invoice_worker.error.connect(self._on_invoice_error)
+        self._invoice_worker.start()
+
+    def _on_invoice_paths_found(self, results, path_sub, ctx_sub, invoice_ctx: InvoiceRoutingContext):
+        self.find_invoice_btn.setEnabled(True)
+
+        dest_hex = invoice_ctx.destination.hex()
+
+        self.source_input.setText(self.own_pubkey.hex())
+        self.dest_input.setText(dest_hex)
+        self.amount_input.setText(str(invoice_ctx.amount_msat // 1000))
+
+        self._node_labels.clear()
+        self._node_labels.update({
+            self.own_pubkey: _('Sender'),
+            invoice_ctx.destination: _('Recipient'),
+        })
+
+        # node may not be in self._nodes yet if it only appeared in the path subgraph
+        dest_node = ctx_sub[0].get(invoice_ctx.destination) or self._nodes.get(invoice_ctx.destination)
+        dest_name = self._node_display(dest_node, invoice_ctx.destination)
+        lines = [
+            f"=== Invoice ===",
+            f"Destination: {dest_name} ({dest_hex[:16]}...)",
+            f"Amount:      {invoice_ctx.amount_msat // 1000} sat ({invoice_ctx.amount_msat} msat)",
+            f"Description: {invoice_ctx.description or '(none)'}",
+            f"Payment Hash: {invoice_ctx.payment_hash.hex()}",
+            f"Route Hints: {invoice_ctx.route_hint_count} private path(s)",
+            f"CLTV Delta:  {invoice_ctx.min_final_cltv_delta}",
+        ]
+        self.detail_text.setPlainText('\n'.join(lines))
+
+        self._invoice_worker = None
+        self._on_paths_found(self.own_pubkey, invoice_ctx.destination,
+                             invoice_ctx.amount_msat, results, path_sub, ctx_sub)
+
+    def _on_invoice_error(self, error_msg: str):
+        self.find_invoice_btn.setEnabled(True)
+        self._invoice_worker = None
+        self.status_label.setText(_('Invoice error: {}').format(error_msg))
 
     # --- search ---
 
@@ -595,6 +730,7 @@ class GraphDialog(QDialog):
 
     def _on_db_search_result(self, node_id, alias):
         self.search_btn.setEnabled(True)
+        self._search_worker = None
         if node_id is not None:
             self.seed_input.setText(node_id.hex())
             self.status_label.setText(
@@ -631,8 +767,8 @@ class GraphDialog(QDialog):
 
         n1 = self._nodes.get(edge.node1_id)
         n2 = self._nodes.get(edge.node2_id)
-        n1_name = get_node_display_name(n1) if n1 else edge.node1_id.hex()[:16]
-        n2_name = get_node_display_name(n2) if n2 else edge.node2_id.hex()[:16]
+        n1_name = self._node_display(n1, edge.node1_id)
+        n2_name = self._node_display(n2, edge.node2_id)
 
         cap_str = f"{edge.capacity_sat:,}" if edge.capacity_sat else "unknown"
 
@@ -697,7 +833,8 @@ class GraphDialog(QDialog):
         self.status_label.setText(' | '.join(parts))
 
     def closeEvent(self, event):
-        for worker in (self._layout_worker, self._data_worker, self._path_worker, self._search_worker):
+        for worker in (self._layout_worker, self._data_worker, self._path_worker,
+                       self._search_worker, self._invoice_worker):
             self._stop_worker(worker)
         super().closeEvent(event)
 
@@ -732,14 +869,16 @@ class Plugin(BasePlugin):
             return
 
         own_pubkey = None
+        lnworker = None
         wallet = window.wallet
         if wallet and hasattr(wallet, 'lnworker') and wallet.lnworker:
+            lnworker = wallet.lnworker
             try:
-                own_pubkey = wallet.lnworker.node_keypair.pubkey
+                own_pubkey = lnworker.node_keypair.pubkey
             except Exception:
                 pass
 
-        dialog = GraphDialog(network.channel_db, own_pubkey, parent=window)
+        dialog = GraphDialog(network.channel_db, own_pubkey, parent=window, lnworker=lnworker)
         self._dialogs[win_id] = dialog
         dialog.finished.connect(lambda _=None, wid=win_id: self._dialogs.pop(wid, None))
         dialog.showMaximized()

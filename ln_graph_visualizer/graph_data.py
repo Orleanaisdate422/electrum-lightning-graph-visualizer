@@ -4,7 +4,7 @@ from collections import deque
 
 if TYPE_CHECKING:
     from electrum.channel_db import ChannelDB
-    from electrum.lnrouter import PathEdge
+    from electrum.lnrouter import PathEdge, RouteEdge
     from electrum.util import ShortChannelID
 
 
@@ -37,6 +37,7 @@ class GraphEdge:
     capacity_sat: Optional[int]
     policy_1to2: Optional[PolicyData] = None
     policy_2to1: Optional[PolicyData] = None
+    is_private: bool = False
 
 
 def _policy_from_db(policy) -> Optional[PolicyData]:
@@ -146,6 +147,37 @@ def _collect_edges_for_node(
     return neighbors
 
 
+def make_synthetic_graph_edge(route_edge: 'RouteEdge') -> GraphEdge:
+    """Create a GraphEdge from a RouteEdge for private channels not in channel_db."""
+    forward = route_edge.start_node <= route_edge.end_node
+    if forward:
+        node1_id, node2_id = route_edge.start_node, route_edge.end_node
+    else:
+        node1_id, node2_id = route_edge.end_node, route_edge.start_node
+    policy = PolicyData(
+        fee_base_msat=route_edge.fee_base_msat,
+        fee_proportional_millionths=route_edge.fee_proportional_millionths,
+        cltv_delta=route_edge.cltv_delta,
+        htlc_minimum_msat=0,
+        htlc_maximum_msat=None,
+        is_disabled=False,
+        timestamp=0,
+    )
+    if forward:
+        policy_1to2, policy_2to1 = policy, None
+    else:
+        policy_1to2, policy_2to1 = None, policy
+    return GraphEdge(
+        short_channel_id=route_edge.short_channel_id,
+        node1_id=node1_id,
+        node2_id=node2_id,
+        capacity_sat=None,
+        policy_1to2=policy_1to2,
+        policy_2to1=policy_2to1,
+        is_private=True,
+    )
+
+
 def extract_neighborhood(
     channel_db: 'ChannelDB',
     seed_node_id: bytes,
@@ -192,6 +224,7 @@ def extract_path_subgraph(
     channel_db: 'ChannelDB',
     paths: Sequence[Sequence['PathEdge']],
     context_hops: int = 1,
+    private_route_edges: Optional[Dict['ShortChannelID', 'RouteEdge']] = None,
 ) -> Tuple[Dict[bytes, GraphNode], Dict['ShortChannelID', GraphEdge],
            Dict[bytes, GraphNode], Dict['ShortChannelID', GraphEdge]]:
     """Extract nodes/edges from found paths plus N-hop context around path nodes.
@@ -216,6 +249,8 @@ def extract_path_subgraph(
         edge = _make_graph_edge(channel_db, scid)
         if edge is not None:
             edges[scid] = edge
+        elif private_route_edges and scid in private_route_edges:
+            edges[scid] = make_synthetic_graph_edge(private_route_edges[scid])
 
     # add path nodes and context
     context_node_ids: Set[bytes] = set()
@@ -223,7 +258,7 @@ def extract_path_subgraph(
         node_channels = channel_db.get_channels_for_node(nid)
         nodes[nid] = _make_graph_node(channel_db, nid,
                                       channel_count=len(node_channels))
-        if context_hops >= 1:
+        if context_hops >= 1 and node_channels:
             context_node_ids.update(
                 _collect_edges_for_node(channel_db, nid, edges, node_channels))
 
@@ -238,7 +273,11 @@ def extract_path_subgraph(
     return nodes, edges, path_only_nodes, path_only_edges
 
 
-def get_node_display_name(node: GraphNode) -> str:
-    if node.alias:
-        return node.alias
-    return node.node_id.hex()[:16] + '...'
+def get_node_display_name(node: Optional[GraphNode], node_id: Optional[bytes] = None) -> str:
+    if node is not None:
+        if node.alias:
+            return node.alias
+        node_id = node.node_id
+    if node_id is not None:
+        return node_id.hex()[:16] + '...'
+    return '???'

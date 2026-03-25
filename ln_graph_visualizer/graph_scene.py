@@ -29,6 +29,7 @@ NODE_SOURCE_COLOR = QColor('#27ae60')
 NODE_DEST_COLOR = QColor('#8e44ad')
 EDGE_DEFAULT_COLOR = QColor('#95a5a6')
 EDGE_DISABLED_COLOR = QColor('#d5dbdb')
+EDGE_PRIVATE_COLOR = QColor('#1abc9c')
 
 
 def _node_radius(channel_count: int) -> float:
@@ -137,6 +138,8 @@ class EdgeItem(QGraphicsPathItem):
     def _apply_style(self):
         if self._highlight_color:
             pen = QPen(self._highlight_color, self._highlight_width)
+        elif self.edge.is_private:
+            pen = QPen(EDGE_PRIVATE_COLOR, self._default_width, Qt.PenStyle.DashDotLine)
         elif self._is_disabled:
             pen = QPen(EDGE_DISABLED_COLOR, self._default_width, Qt.PenStyle.DashLine)
         else:
