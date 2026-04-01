@@ -1,8 +1,8 @@
 {
   "name": "ln_graph_visualizer",
   "fullname": "LN Graph Visualizer",
-  "version": "0.0.2",
-  "description": "Visualize the Lightning Network graph from gossip data. Inspect nodes, channels, and debug pathfinding.",
+  "version": "0.0.3",
+  "description": "Visualize the Lightning Network graph from gossip data. Inspect nodes, channels, and debug pathfinding. A/B testing.",
   "author": "f321x",
   "available_for": ["qt"],
   "icon": "ln_graph.png"
